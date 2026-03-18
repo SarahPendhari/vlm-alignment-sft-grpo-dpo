@@ -1,0 +1,10 @@
+torch
+torchvision
+transformers
+datasets
+peft
+accelerate
+bitsandbytes
+sentencepiece
+einops
+wandb
