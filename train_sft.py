@@ -48,7 +48,7 @@ print(f"Running on: {device} | dtype: {dtype}")
 print("Loading model...")
 model = AutoModelForImageTextToText.from_pretrained(
     MODEL_NAME,
-    dtype=dtype,
+    torch_dtype=dtype,
     device_map="auto" if USE_CUDA else None,
     trust_remote_code=True
 )
