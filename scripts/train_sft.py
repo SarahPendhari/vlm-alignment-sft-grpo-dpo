@@ -23,7 +23,7 @@ OUTPUT_DIR = "./outputs/qwen_sft"
 # =========================
 # 2. Load Model + Processor
 # =========================
-print("🔹 Loading model...")
+print("Loading model...")
 model = AutoModelForVision2Seq.from_pretrained(
     MODEL_NAME,
     torch_dtype=torch.float16,
@@ -36,7 +36,7 @@ processor = AutoProcessor.from_pretrained(MODEL_NAME)
 # =========================
 # 3. Apply LoRA
 # =========================
-print("🔹 Applying LoRA...")
+print("Applying LoRA...")
 lora_config = LoraConfig(
     r=64,
     lora_alpha=128,
@@ -53,10 +53,10 @@ model.print_trainable_parameters()
 # =========================
 # 4. Load Dataset
 # =========================
-print("🔹 Loading dataset...")
+print("Loading dataset...")
 dataset = load_dataset("HuggingFaceM4/VQAv2", split=DATA_SPLIT)
 
-print("🔹 Formatting dataset...")
+print("Formatting dataset...")
 dataset = dataset.map(format_example)
 
 
@@ -80,7 +80,7 @@ training_args = TrainingArguments(
 # =========================
 # 6. Trainer
 # =========================
-print("🔹 Initializing Trainer...")
+print("Initializing Trainer...")
 
 trainer = Trainer(
     model=model,
@@ -100,7 +100,7 @@ trainer.train()
 # =========================
 # 8. Save Model
 # =========================
-print("💾 Saving model...")
+print("Saving model...")
 model.save_pretrained(OUTPUT_DIR)
 processor.save_pretrained(OUTPUT_DIR)
 
