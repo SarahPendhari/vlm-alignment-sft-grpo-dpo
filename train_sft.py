@@ -17,6 +17,13 @@ from src.collate import collate_fn
 from torch.utils.data import DataLoader, IterableDataset
 from itertools import islice
 
+# DataLoader perf knobs
+NUM_WORKERS = 2
+PIN_MEMORY = torch.cuda.is_available()
+
+# Optional (advanced) speed boost
+USE_TORCH_COMPILE = False
+
 # =========================
 # Config
 # =========================
@@ -75,12 +82,35 @@ except Exception as e:
     print(f"Forward pass failed: {e}")
 
 # =========================
+# Training perf settings
+# =========================
+# Important for training memory/speed
+try:
+    model.config.use_cache = False
+except Exception:
+    pass
+
+# Saves VRAM; compute increases slightly
+try:
+    model.gradient_checkpointing_enable()
+except Exception:
+    pass
+
+# Optional advanced speed boost (mostly useful on CUDA)
+if USE_TORCH_COMPILE and torch.cuda.is_available():
+    try:
+        model = torch.compile(model)
+        print("torch.compile enabled")
+    except Exception as e:
+        print(f"torch.compile failed (continuing without): {e}")
+
+# =========================
 # LoRA
 # =========================
 print("Applying LoRA...")
 lora_config = LoraConfig(
-    r=64,
-    lora_alpha=128,
+    r=16,
+    lora_alpha=32,
     target_modules=[
         "q_proj", "k_proj", "v_proj", "o_proj",
         "gate_proj", "up_proj", "down_proj"
@@ -122,6 +152,8 @@ def make_train_loader():
     return DataLoader(
         train_dataset,
         batch_size=BATCH_SIZE,
+        num_workers=NUM_WORKERS,
+        pin_memory=PIN_MEMORY,
         collate_fn=lambda x: collate_fn(x, processor),
     )
 
@@ -133,6 +165,8 @@ def make_val_loader():
     return DataLoader(
         val_dataset,
         batch_size=BATCH_SIZE,
+        num_workers=NUM_WORKERS,
+        pin_memory=PIN_MEMORY,
         collate_fn=lambda x: collate_fn(x, processor),
     )
 
@@ -173,7 +207,9 @@ print(f"  LR:           {LEARNING_RATE}\n")
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 model.train()
 optimizer.zero_grad()
-running_loss = 0.0
+
+# Keep loss as tensors to avoid per-step GPU sync (.item())
+running_loss_t = torch.zeros((), device=device)
 
 train_losses = []
 val_losses = []
@@ -184,7 +220,7 @@ for epoch in range(NUM_EPOCHS):
     train_loader = make_train_loader()
     val_loader = make_val_loader()
 
-    epoch_train_loss_sum = 0.0
+    epoch_train_loss_sum_t = torch.zeros((), device=device)
     for step, batch in enumerate(train_loader):
         if step >= steps_per_epoch:
             break
@@ -192,8 +228,9 @@ for epoch in range(NUM_EPOCHS):
 
         outputs = model(**inputs)
         loss = outputs.loss / GRAD_ACCUM_STEPS
-        running_loss += loss.item() * GRAD_ACCUM_STEPS
-        epoch_train_loss_sum += loss.item() * GRAD_ACCUM_STEPS
+        loss_unscaled = outputs.loss.detach()
+        running_loss_t += loss_unscaled
+        epoch_train_loss_sum_t += loss_unscaled
         loss.backward()
 
         is_accum_step = (step + 1) % GRAD_ACCUM_STEPS == 0
@@ -206,26 +243,26 @@ for epoch in range(NUM_EPOCHS):
             optimizer.zero_grad()
 
             opt_step     = (step + 1) // GRAD_ACCUM_STEPS
-            avg_loss     = running_loss / GRAD_ACCUM_STEPS
-            running_loss = 0.0
+            avg_loss     = (running_loss_t / GRAD_ACCUM_STEPS).item()
+            running_loss_t.zero_()
             print(f"  step {step+1:>3}/{steps_per_epoch}"
                   f" | opt step {opt_step}"
                   f" | loss {avg_loss:.4f}"
                   f" | lr {scheduler.get_last_lr()[0]:.2e}")
 
-    epoch_train_loss = epoch_train_loss_sum / max(steps_per_epoch, 1)
+    epoch_train_loss = (epoch_train_loss_sum_t / max(steps_per_epoch, 1)).item()
     model.eval()
-    val_loss_sum = 0.0
+    val_loss_sum_t = torch.zeros((), device=device)
     with torch.no_grad():
         for step, batch in enumerate(val_loader):
             if step >= math.ceil(VAL_EXAMPLES / BATCH_SIZE):
                 break
             inputs = {k: v.to(device) for k, v in batch.items()}
             outputs = model(**inputs)
-            val_loss_sum += outputs.loss.item()
+            val_loss_sum_t += outputs.loss.detach()
 
     val_steps = math.ceil(VAL_EXAMPLES / BATCH_SIZE)
-    epoch_val_loss = val_loss_sum / max(val_steps, 1)
+    epoch_val_loss = (val_loss_sum_t / max(val_steps, 1)).item()
     train_losses.append(epoch_train_loss)
     val_losses.append(epoch_val_loss)
     print(f"  -> epoch train loss: {epoch_train_loss:.4f} | val loss: {epoch_val_loss:.4f}")

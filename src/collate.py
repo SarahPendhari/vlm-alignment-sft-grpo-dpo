@@ -33,7 +33,13 @@ def collate_fn(batch, processor):
 
         texts.append(text)
         prompt_texts.append(prompt_text)
-        images.append([item["image"]])
+        image = item["image"]
+        # Reduce visual tokens + memory (much faster)
+        try:
+            image = image.resize((224, 224))
+        except Exception:
+            pass
+        images.append([image])
 
     encoded = processor(
         text=texts,
