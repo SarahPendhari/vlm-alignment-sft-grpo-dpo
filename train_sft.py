@@ -5,6 +5,7 @@ import torch
 from torch.optim import AdamW
 import json
 import math
+import hashlib
 from transformers import (
     AutoProcessor,
     AutoModelForImageTextToText,
@@ -32,6 +33,13 @@ TRAIN_SPLIT       = "validation"
 VAL_SPLIT         = "testdev"
 TRAIN_EXAMPLES    = 200
 VAL_EXAMPLES      = 50
+SEED              = 0
+# Buffered shuffle for streaming (approximate shuffle).
+# On a T4, 2k–10k is usually a good tradeoff (CPU RAM vs randomness).
+SHUFFLE_BUFFER_SIZE = 4096
+# If TRAIN_SPLIT == VAL_SPLIT, deterministically partition that split
+# into disjoint train/val streams using a stable hash.
+VAL_FRACTION      = 0.2
 OUTPUT_DIR        = "./outputs/qwen_sft"
 GRAD_ACCUM_STEPS  = 8
 BATCH_SIZE        = 1
@@ -131,6 +139,21 @@ print("Loading dataset...")
 def limit_stream(stream, max_examples):
     return islice(stream, max_examples)
 
+def _stable_id(example: dict) -> str:
+    for k in ("question_id", "id", "example_id", "image_id"):
+        if k in example and example[k] is not None:
+            return str(example[k])
+    q = str(example.get("question", ""))
+    img = str(example.get("image_id", ""))
+    return f"{q}|{img}"
+
+def _in_val(example: dict, val_fraction: float) -> bool:
+    sid = _stable_id(example)
+    h = hashlib.md5(sid.encode("utf-8")).hexdigest()
+    # map to [0,1)
+    bucket = int(h[:8], 16) / 0x100000000
+    return bucket < val_fraction
+
 
 class StreamingDataset(IterableDataset):
     def __init__(self, iterator, transform=None):
@@ -139,14 +162,29 @@ class StreamingDataset(IterableDataset):
         self.transform = transform
 
     def __iter__(self):
-        for example in self.iterator:
+        # Make IterableDataset safe with num_workers>0 (avoid duplicated samples).
+        worker_info = torch.utils.data.get_worker_info()
+        if worker_info is None:
+            worker_id = 0
+            num_workers = 1
+        else:
+            worker_id = worker_info.id
+            num_workers = worker_info.num_workers
+
+        for idx, example in enumerate(self.iterator):
+            if (idx % num_workers) != worker_id:
+                continue
             if self.transform:
                 example = self.transform(example)
             yield example
 
 
-def make_train_loader():
+def make_train_loader(epoch: int):
     train_stream = load_dataset("lmms-lab/VQAv2", split=TRAIN_SPLIT, streaming=True)
+    if TRAIN_SPLIT == VAL_SPLIT:
+        train_stream = train_stream.filter(lambda ex: not _in_val(ex, VAL_FRACTION))
+    # Resample each epoch via epoch-dependent seed.
+    train_stream = train_stream.shuffle(buffer_size=SHUFFLE_BUFFER_SIZE, seed=SEED + epoch)
     train_stream = limit_stream(train_stream, TRAIN_EXAMPLES)
     train_dataset = StreamingDataset(train_stream, transform=format_example)
     return DataLoader(
@@ -160,6 +198,8 @@ def make_train_loader():
 
 def make_val_loader():
     val_stream = load_dataset("lmms-lab/VQAv2", split=VAL_SPLIT, streaming=True)
+    if TRAIN_SPLIT == VAL_SPLIT:
+        val_stream = val_stream.filter(lambda ex: _in_val(ex, VAL_FRACTION))
     val_stream = limit_stream(val_stream, VAL_EXAMPLES)
     val_dataset = StreamingDataset(val_stream, transform=format_example)
     return DataLoader(
@@ -217,7 +257,7 @@ val_losses = []
 for epoch in range(NUM_EPOCHS):
     print(f"--- Epoch {epoch + 1}/{NUM_EPOCHS} ---")
 
-    train_loader = make_train_loader()
+    train_loader = make_train_loader(epoch)
     val_loader = make_val_loader()
 
     epoch_train_loss_sum_t = torch.zeros((), device=device)
