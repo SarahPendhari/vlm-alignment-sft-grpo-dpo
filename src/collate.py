@@ -1,28 +1,39 @@
 def collate_fn(batch, processor):
-    texts, images = [], []
+    texts = []
+    images = []
+    prompt_texts = []
 
     for item in batch:
-        # Inject image into the user message at collation time
         messages_with_image = []
+        prompt_messages = []
+
         for msg in item["messages"]:
             if msg["role"] == "user":
-                messages_with_image.append({
+                user_msg = {
                     "role": "user",
-                    "content": [
-                        {"type": "image"},              # placeholder — processor fills this in
-                        *msg["content"]                 # existing text content
-                    ]
-                })
+                    "content": [{"type": "image"}, *msg["content"]],
+                }
+                messages_with_image.append(user_msg)
+                prompt_messages.append(user_msg)
             else:
                 messages_with_image.append(msg)
+                if msg is not item["messages"][-1]:
+                    prompt_messages.append(msg)
 
         text = processor.apply_chat_template(
             messages_with_image,
             tokenize=False,
-            add_generation_prompt=False
+            add_generation_prompt=False,
         )
+        prompt_text = processor.apply_chat_template(
+            prompt_messages,
+            tokenize=False,
+            add_generation_prompt=True,
+        )
+
         texts.append(text)
-        images.append([item["image"]])                  # PIL image passed separately
+        prompt_texts.append(prompt_text)
+        images.append([item["image"]])
 
     encoded = processor(
         text=texts,
@@ -30,33 +41,21 @@ def collate_fn(batch, processor):
         padding=True,
         truncation=True,
         max_length=1024,
-        return_tensors="pt"
+        return_tensors="pt",
     )
 
-    # Prompt masking — only compute loss on assistant tokens
-    labels = encoded["input_ids"].clone()
-    for i, item in enumerate(batch):
-        # Rebuild prompt-only messages with image placeholder for length calculation
-        prompt_messages = []
-        for msg in item["messages"][:-1]:              # exclude assistant turn
-            if msg["role"] == "user":
-                prompt_messages.append({
-                    "role": "user",
-                    "content": [{"type": "image"}, *msg["content"]]
-                })
-            else:
-                prompt_messages.append(msg)
+    prompt_ids = processor.tokenizer(
+        prompt_texts,
+        add_special_tokens=False,
+        padding=False,
+        truncation=True,
+        max_length=1024,
+    )["input_ids"]
+    prompt_lens = [len(ids) for ids in prompt_ids]
 
-        prompt_only = processor.apply_chat_template(
-            prompt_messages,
-            tokenize=False,
-            add_generation_prompt=True
-        )
-        prompt_len = len(processor.tokenizer(
-            prompt_only,
-            add_special_tokens=False
-        )["input_ids"])
-        labels[i, :prompt_len] = -100
+    labels = encoded["input_ids"].clone()
+    for i, plen in enumerate(prompt_lens):
+        labels[i, :plen] = -100
 
     labels[labels == processor.tokenizer.pad_token_id] = -100
     encoded["labels"] = labels
