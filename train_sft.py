@@ -18,7 +18,7 @@ from src.collate import collate_fn
 # Config
 # =========================
 MODEL_NAME        = "Qwen/Qwen2-VL-2B-Instruct"
-TRAIN_SPLIT       = "train[:2%]"
+TRAIN_SPLIT       = "train[:50]"
 VAL_SPLIT         = "validation[:50]"
 OUTPUT_DIR        = "./outputs/qwen_sft"
 GRAD_ACCUM_STEPS  = 8
