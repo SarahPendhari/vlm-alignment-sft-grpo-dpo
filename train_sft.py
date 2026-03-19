@@ -28,14 +28,14 @@ USE_TORCH_COMPILE = False
 # Config
 # =========================
 MODEL_NAME        = "Qwen/Qwen2-VL-2B-Instruct"
-TRAIN_SPLIT       = "train"
-VAL_SPLIT         = "validation"
+TRAIN_SPLIT       = "validation"
+VAL_SPLIT         = "testdev"
 TRAIN_EXAMPLES    = 200
 VAL_EXAMPLES      = 50
 OUTPUT_DIR        = "./outputs/qwen_sft"
 GRAD_ACCUM_STEPS  = 8
 BATCH_SIZE        = 1
-NUM_EPOCHS        = 1
+NUM_EPOCHS        = 4
 LEARNING_RATE     = 2e-5
 
 USE_MPS  = torch.backends.mps.is_available()
