@@ -1,27 +1,36 @@
-SYSTEM_PROMPT = (
-    "You are a visual reasoning assistant. "
-    "Think step by step inside <think>...</think>, "
-    "then give your final answer inside <answer>...</answer>."
-)
+# src/data.py
+from collections import Counter
 
 def format_example(example):
-    answer = example.get("multiple_choice_answer") or example.get("answer", "")
+    """
+    Convert a VQAv2 example into a conversational format suitable for Qwen2-VL.
+    The most frequent answer among annotators is used as the target.
+    """
+    question = example["question"]
+    answers = [a["answer"] for a in example["answers"]]
+    answer = Counter(answers).most_common(1)[0][0]
+
+    # Use the conversational messages format required by Qwen2-VL
+    messages = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "image"},
+                {"type": "text", "text": f"Question: {question}"}
+            ]
+        },
+        {
+            "role": "assistant",
+            "content": [
+                {"type": "text", "text": f"<think> </think>\n<answer> {answer} </answer>"}
+            ]
+        }
+    ]
+
     return {
-        "image": example["image"],       # keep image separate — NOT inside messages
-        "messages": [
-            {
-                "role": "system",
-                "content": [{"type": "text", "text": SYSTEM_PROMPT}]
-            },
-            {
-                "role": "user",
-                "content": [{"type": "text", "text": example["question"]}]
-                # no image here — collator will inject it from the "image" field
-            },
-            {
-                "role": "assistant",
-                "content": [{"type": "text", "text": f"<think></think><answer>{answer}</answer>"}]
-            }
-        ],
-        "answer": answer
+        "image": example["image"],
+        "messages": messages, # <--- This is the key the collator is looking for!
+        "answer": answer,
+        "answers": answers,
+        "question_id": example["question_id"]
     }

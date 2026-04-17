@@ -1,79 +1,98 @@
-import sys, os
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
-
+import os
 import torch
-from torch.optim import AdamW
+from datasets import load_dataset
 from transformers import (
     AutoProcessor,
-    AutoModelForImageTextToText,
-    get_cosine_schedule_with_warmup
+    Qwen2VLForConditionalGeneration,
+    TrainingArguments,
+    Trainer
 )
 from peft import LoraConfig, get_peft_model
-from datasets import load_dataset
 from src.data import format_example
-from src.collate import collate_fn
+
+# =========================
+# Collate Function (UNCHANGED)
+# =========================
+def collate_fn(batch, processor):
+    texts = [
+        processor.apply_chat_template(
+            item["messages"], 
+            tokenize=False, 
+            add_generation_prompt=False
+        )
+        for item in batch
+    ]
+    images = [item["image"] for item in batch]
+
+    inputs = processor(
+        text=texts,
+        images=images,
+        padding=True,
+        return_tensors="pt"
+    )
+
+    labels = inputs["input_ids"].clone()
+    tokenizer = processor.tokenizer
+    
+    if tokenizer.pad_token_id is not None:
+        labels[labels == tokenizer.pad_token_id] = -100
+
+    im_start_id = tokenizer.convert_tokens_to_ids("<|im_start|>")
+    
+    for i in range(labels.size(0)):
+        matches = (labels[i] == im_start_id).nonzero(as_tuple=True)[0]
+        
+        if len(matches) > 0:
+            assistant_start_idx = matches[-1].item() + 3
+            labels[i, :assistant_start_idx] = -100
+
+    inputs["labels"] = labels
+    return inputs
 
 # =========================
 # Config
 # =========================
-MODEL_NAME        = "Qwen/Qwen2-VL-2B-Instruct"
-DATA_SPLIT        = "validation[:50]"
-OUTPUT_DIR        = "./outputs/qwen_sft"
-GRAD_ACCUM_STEPS  = 8
-BATCH_SIZE        = 1
-NUM_EPOCHS        = 1
-LEARNING_RATE     = 2e-5
+DEBUG = os.environ.get("DEBUG", "0") == "1"
 
-USE_MPS  = torch.backends.mps.is_available()
-USE_CUDA = torch.cuda.is_available()
+MODEL_NAME = "Qwen/Qwen2-VL-2B-Instruct"
 
-# =========================
-# Device setup
-# =========================
-if USE_CUDA:
-    dtype  = torch.bfloat16
-    device = "cuda"
-elif USE_MPS:
-    dtype  = torch.float16
-    device = "mps"
-else:
-    dtype  = torch.float32
-    device = "cpu"
+OUTPUT_DIR = "./outputs/qwen_sft"
+CACHE_DIR = os.environ.get("HF_HOME", "./cache")
 
-print(f"Running on: {device} | dtype: {dtype}")
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+print("CUDA available:", torch.cuda.is_available())
+if torch.cuda.is_available():
+    print("GPU:", torch.cuda.get_device_name(0))
 
 # =========================
-# Model + Processor
+# Load Model + Processor
 # =========================
 print("Loading model...")
-model = AutoModelForImageTextToText.from_pretrained(
+model = Qwen2VLForConditionalGeneration.from_pretrained(
     MODEL_NAME,
-    torch_dtype=dtype,
-    device_map="auto" if USE_CUDA else None,
-    trust_remote_code=True
+    torch_dtype=torch.float16,
+    device_map="auto",
+    cache_dir=CACHE_DIR
 )
-if not USE_CUDA:
-    model = model.to(device)
+print("Model loaded")
 
-processor = AutoProcessor.from_pretrained(MODEL_NAME, trust_remote_code=True)
-processor.tokenizer.padding_side = "right"
+processor = AutoProcessor.from_pretrained(
+    MODEL_NAME,
+    cache_dir=CACHE_DIR
+)
+print("Processor loaded")
 
-print("Running forward pass sanity check...")
-dummy_input = torch.zeros(1, 1, dtype=torch.long).to(device)
-try:
-    with torch.no_grad():
-        model(input_ids=dummy_input)
-    print(f"Forward pass OK on {device}")
-except Exception as e:
-    print(f"Forward pass failed: {e}")
+model.gradient_checkpointing_enable()
+model.enable_input_require_grads()
 
 # =========================
-# LoRA
+# Apply LoRA (FASTER)
 # =========================
 print("Applying LoRA...")
 lora_config = LoraConfig(
-    r=64,
-    lora_alpha=128,
+    r=16, 
+    lora_alpha=32,
     target_modules=[
         "q_proj", "k_proj", "v_proj", "o_proj",
         "gate_proj", "up_proj", "down_proj"
@@ -82,102 +101,89 @@ lora_config = LoraConfig(
     bias="none",
     task_type="CAUSAL_LM"
 )
+
 model = get_peft_model(model, lora_config)
-model.enable_input_require_grads()
 model.print_trainable_parameters()
 
 # =========================
-# Dataset
+# Load Dataset (20% SHUFFLED)
 # =========================
 print("Loading dataset...")
-dataset = load_dataset("lmms-lab/VQAv2", split=DATA_SPLIT)
-print(f"Raw columns: {dataset.column_names}")
 
-dataset = dataset.map(
-    format_example,
-    remove_columns=dataset.column_names,
-    load_from_cache_file=False
-)
-print(f"Formatted columns: {dataset.column_names}")
-
-# Sanity check
-sample = dataset[0]
-assert isinstance(sample["messages"][1]["content"], list), "format_example failed"
-assert sample["image"] is not None, "image missing"
-print(f"✅ Data format correct — {len(dataset)} samples ready")
-
-# =========================
-# Pre-build all batches
-# =========================
-print("Building batches manually...")
-all_batches = []
-for i in range(0, len(dataset), BATCH_SIZE):
-    batch = [dataset[j] for j in range(i, min(i + BATCH_SIZE, len(dataset)))]
-    all_batches.append(collate_fn(batch, processor))
-print(f" Built {len(all_batches)} batches")
-
-# =========================
-# Optimizer + Scheduler
-# =========================
-total_steps  = len(all_batches) * NUM_EPOCHS        # ✅ uses all_batches
-warmup_steps = max(1, int(0.05 * total_steps))
-
-optimizer = AdamW(model.parameters(), lr=LEARNING_RATE, weight_decay=0.01)
-scheduler = get_cosine_schedule_with_warmup(
-    optimizer,
-    num_warmup_steps=warmup_steps,
-    num_training_steps=total_steps
+train_dataset = load_dataset(
+    "HuggingFaceM4/VQAv2",
+    split="train",
+    cache_dir=CACHE_DIR,
+    trust_remote_code=True
 )
 
-# =========================
-# Training Loop
-# =========================
-print(f"\nStarting training...")
-print(f"  Samples:      {len(dataset)}")
-print(f"  Total steps:  {total_steps}")
-print(f"  Grad accum:   every {GRAD_ACCUM_STEPS} steps")
-print(f"  Warmup steps: {warmup_steps}")
-print(f"  LR:           {LEARNING_RATE}\n")
+# Shuffle BEFORE selecting
+train_dataset = train_dataset.shuffle(seed=42).select(
+    range(int(0.2 * len(train_dataset)))
+).map(format_example, num_proc=2, load_from_cache_file=False)
 
-os.makedirs(OUTPUT_DIR, exist_ok=True)
-model.train()
-optimizer.zero_grad()
-running_loss = 0.0
+print("Train dataset size:", len(train_dataset))
 
-for epoch in range(NUM_EPOCHS):
-    print(f"--- Epoch {epoch + 1}/{NUM_EPOCHS} ---")
+val_dataset = load_dataset(
+    "HuggingFaceM4/VQAv2",
+    split="validation",
+    cache_dir=CACHE_DIR,
+    trust_remote_code=True
+)
 
-    for step, batch in enumerate(all_batches):       # ✅ uses all_batches
-        inputs = {k: v.to(device) for k, v in batch.items()}
+val_dataset = val_dataset.shuffle(seed=42).select(
+    range(int(0.1 * len(val_dataset)))  # 10% val is enough
+).map(format_example, num_proc=2, load_from_cache_file=False)
 
-        outputs = model(**inputs)
-        loss = outputs.loss / GRAD_ACCUM_STEPS
-        running_loss += loss.item() * GRAD_ACCUM_STEPS
-        loss.backward()
-
-        is_accum_step = (step + 1) % GRAD_ACCUM_STEPS == 0
-        is_last_step  = (step + 1) == len(all_batches)   # ✅ uses all_batches
-
-        if is_accum_step or is_last_step:
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-            optimizer.step()
-            scheduler.step()
-            optimizer.zero_grad()
-
-            opt_step     = (step + 1) // GRAD_ACCUM_STEPS
-            avg_loss     = running_loss / GRAD_ACCUM_STEPS
-            running_loss = 0.0
-            print(f"  step {step+1:>3}/{len(all_batches)}"  # ✅ uses all_batches
-                  f" | opt step {opt_step}"
-                  f" | loss {avg_loss:.4f}"
-                  f" | lr {scheduler.get_last_lr()[0]:.2e}")
-
-print("\nTraining complete!")
+print("Val dataset size:", len(val_dataset))
 
 # =========================
-# Save
+# Training Arguments (FASTER)
 # =========================
-print("Saving model...")
-model.save_pretrained(OUTPUT_DIR)
+training_args = TrainingArguments(
+    output_dir=OUTPUT_DIR,
+    per_device_train_batch_size=1,
+    per_device_eval_batch_size=1,
+    gradient_accumulation_steps=4,  # ↓ reduced from 8 → faster
+    num_train_epochs=1,
+    learning_rate=2e-4,
+    lr_scheduler_type="cosine",
+    warmup_ratio=0.05,
+    logging_steps=50,
+    save_steps=1000,
+    eval_strategy="steps",
+    eval_steps=1000,
+    fp16=True,
+    bf16=False,
+    report_to="none",
+    remove_unused_columns=False,
+    dataloader_num_workers=2,
+    max_grad_norm=1.0
+)
+
+# =========================
+# Trainer
+# =========================
+print("Initializing Trainer...")
+trainer = Trainer(
+    model=model,
+    args=training_args,
+    train_dataset=train_dataset,
+    eval_dataset=val_dataset,
+    data_collator=lambda batch: collate_fn(batch, processor),
+)
+print("Trainer ready")
+
+# =========================
+# Train
+# =========================
+print("Starting SFT training...")
+trainer.train()
+
+# =========================
+# Save Model
+# =========================
+trainer.save_model(OUTPUT_DIR)
 processor.save_pretrained(OUTPUT_DIR)
-print(f"✅ Done. πref checkpoint saved to {OUTPUT_DIR}")
+
+print("SFT training complete!")
