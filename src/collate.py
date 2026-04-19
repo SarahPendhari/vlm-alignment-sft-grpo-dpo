@@ -1,7 +1,7 @@
 import torch
 
 def collate_fn(batch, processor):
-    # Inject <image> token
+    #  Inject <image> token
     texts = [f"<image>\n{item['text']}" for item in batch]
     images = [item["image"] for item in batch]
 

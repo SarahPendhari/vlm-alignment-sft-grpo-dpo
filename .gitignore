@@ -5,3 +5,5 @@ outputs/
 __pycache__/
 .env
 wandb/
+logs/
+cache/
