@@ -1,5 +1,7 @@
 import torch
 
+
+'''DEPRECATED
 def collate_fn(batch, processor):
     #  Inject <image> token
     texts = [f"<image>\n{item['text']}" for item in batch]
