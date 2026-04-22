@@ -17,9 +17,11 @@ Configuration is controlled via env vars (see `env_*` functions below).
 from __future__ import annotations
 
 import csv
+import json
 import os
 import random
 from dataclasses import dataclass
+from datetime import datetime
 from io import BytesIO
 from itertools import islice
 from pathlib import Path
@@ -188,6 +190,39 @@ class Config:
     log_path: Path
 
 
+def write_run_config(cfg: Config) -> None:
+    cfg.out_dir.mkdir(parents=True, exist_ok=True)
+    payload: Dict[str, Any] = {
+        "project_dir": str(cfg.project_dir),
+        "model_name": cfg.model_name,
+        "cache_dir": cfg.cache_dir,
+        "sft_adapter_dir": str(cfg.sft_adapter_dir),
+        "grpo_adapter_dir": str(cfg.grpo_adapter_dir),
+        "instruction": cfg.instruction,
+        "seed": cfg.seed,
+        "group_size": cfg.group_size,
+        "max_new_tokens": cfg.max_new_tokens,
+        "temperature": cfg.temperature,
+        "top_p": cfg.top_p,
+        "learning_rate": cfg.learning_rate,
+        "gradient_accumulation_steps": cfg.gradient_accumulation_steps,
+        "max_grad_norm": cfg.max_grad_norm,
+        "clip_eps": cfg.clip_eps,
+        "beta_kl": cfg.beta_kl,
+        "smoke_n": cfg.smoke_n,
+        "log_every": cfg.log_every,
+        "save_every": cfg.save_every,
+        "log_table_every": cfg.log_table_every,
+        "out_dir": str(cfg.out_dir),
+        "log_path": str(cfg.log_path),
+        "created_at": datetime.now().isoformat(timespec="seconds"),
+    }
+    path = cfg.out_dir / "run_config.json"
+    with open(path, "w") as f:
+        json.dump(payload, f, indent=2, sort_keys=True)
+    print("RUN_CONFIG:", str(path))
+
+
 def load_config() -> Config:
     project_dir = Path(env_str("PROJECT_DIR", str(Path(__file__).resolve().parent))).resolve()
 
@@ -206,8 +241,19 @@ def load_config() -> Config:
     instruction_raw = os.environ.get("INSTRUCTION", "ONE WORD WITHOUT BALISE, NO <answer> OR <thinking> ")
     instruction = instruction_raw.strip() if isinstance(instruction_raw, str) and instruction_raw.strip() else None
 
-    out_dir = Path(env_str("GRPO_SMOKE_OUT", str(project_dir / "outputs" / "grpo_run"))).resolve()
-    log_path = Path(env_str("GRPO_LOG_TABLE_PATH", str(out_dir / "grpo_metrics.tsv"))).resolve()
+    # Output dir: if user doesn't specify, make it unique per run to avoid overwriting.
+    out_dir_env = os.environ.get("GRPO_SMOKE_OUT", "").strip()
+    if out_dir_env:
+        out_dir = Path(out_dir_env).expanduser().resolve()
+    else:
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        out_dir = (project_dir / "outputs" / "grpo_runs" / f"run_{ts}").resolve()
+
+    log_path_env = os.environ.get("GRPO_LOG_TABLE_PATH", "").strip()
+    if log_path_env:
+        log_path = Path(log_path_env).expanduser().resolve()
+    else:
+        log_path = (out_dir / "grpo_metrics.tsv").resolve()
 
     return Config(
         project_dir=project_dir,
@@ -276,6 +322,7 @@ def main() -> None:
     seed_everything(cfg.seed)
 
     cfg.out_dir.mkdir(parents=True, exist_ok=True)
+    write_run_config(cfg)
     log_header = ensure_metrics_tsv(cfg.log_path)
 
     device_dtype = torch.bfloat16 if torch.cuda.is_available() else torch.float32
