@@ -177,8 +177,7 @@ class Config:
     gradient_accumulation_steps: int
     max_grad_norm: float
 
-    # GRPO/PPO
-    clip_eps: float
+    # GRPO
     beta_kl: float
 
     # runtime
@@ -207,7 +206,6 @@ def write_run_config(cfg: Config) -> None:
         "learning_rate": cfg.learning_rate,
         "gradient_accumulation_steps": cfg.gradient_accumulation_steps,
         "max_grad_norm": cfg.max_grad_norm,
-        "clip_eps": cfg.clip_eps,
         "beta_kl": cfg.beta_kl,
         "smoke_n": cfg.smoke_n,
         "log_every": cfg.log_every,
@@ -264,15 +262,14 @@ def load_config() -> Config:
         instruction=instruction,
         seed=env_int("SEED", 0),
         smoke_n=env_int("GRPO_SMOKE_N", 15000),
-        group_size=env_int("GRPO_GROUP_SIZE", 4),
+        group_size=env_int("GRPO_GROUP_SIZE", 8),
         max_new_tokens=env_int("GRPO_MAX_NEW_TOKENS", 32),
         temperature=env_float("GRPO_TEMPERATURE", 0.8),
         top_p=env_float("GRPO_TOP_P", 0.9),
         learning_rate=env_float("GRPO_LR", 1e-4),
         gradient_accumulation_steps=env_int("GRPO_GRAD_ACCUM", 8),
         max_grad_norm=env_float("GRPO_MAX_GRAD_NORM", 1.0),
-        clip_eps=env_float("GRPO_CLIP_EPS", 0.2),
-        beta_kl=env_float("GRPO_BETA_KL", 0.02),
+        beta_kl=env_float("GRPO_BETA_KL", 0.05),
         log_every=env_int("GRPO_LOG_EVERY", 2),
         save_every=env_int("GRPO_SAVE_EVERY", 500),
         log_table_every=env_int("GRPO_LOG_TABLE_EVERY", 100),
@@ -297,8 +294,6 @@ def ensure_metrics_tsv(log_path: Path) -> List[str]:
         # losses
         "policy_loss_mean",
         "total_loss_mean",
-        # PPO diagnostics
-        "clip_frac_mean",
         # advantages
         "adv_mean",
         "adv_std",
@@ -394,7 +389,6 @@ def main() -> None:
     win_kls: List[float] = []
     win_policy_losses: List[float] = []
     win_total_losses: List[float] = []
-    win_clip_fracs: List[float] = []
     win_adv: List[torch.Tensor] = []
     win_gen_lens: List[float] = []
     win_unique_frac: List[float] = []
@@ -466,16 +460,13 @@ def main() -> None:
             vqa_scores = torch.tensor([vqa_accuracy(g, answers) for g in raw_generations], device=padded.device)
 
         logp_new = logprobs_of_generated_tokens(model, padded, attn, prompt_len=prompt_len)
-        logp_old = logp_new.detach()
 
         with torch.no_grad():
             with model.disable_adapter():
                 logp_ref = logprobs_of_generated_tokens(model, padded, attn, prompt_len=prompt_len)
 
-        ratio = torch.exp(logp_new - logp_old)
-        clipped = torch.clamp(ratio, 1.0 - cfg.clip_eps, 1.0 + cfg.clip_eps)
-        pg = torch.minimum(ratio * advantages, clipped * advantages)
-        policy_loss = -pg.mean()
+        # GRPO (no PPO): policy gradient weighted by group-normalized advantages.
+        policy_loss = -(advantages * logp_new).mean()
 
         kl = logp_new - logp_ref
         kl_mean = kl.mean()
@@ -485,7 +476,6 @@ def main() -> None:
 
         # --- diagnostics to log ---
         with torch.no_grad():
-            clip_frac = (clipped != ratio).to(torch.float32).mean()
             gen_lens = attn[:, prompt_len:].sum(dim=-1).to(torch.float32).clamp_min(1.0)
             gen_len_mean = gen_lens.mean()
             uniq = len(set([s.strip() for s in raw_generations]))
@@ -511,7 +501,6 @@ def main() -> None:
         win_kls.append(float(kl_mean.item()))
         win_policy_losses.append(float(policy_loss.item()))
         win_total_losses.append(float((policy_loss + kl_loss).item()))
-        win_clip_fracs.append(float(clip_frac.item()))
         win_adv.append(advantages.detach().float().cpu())
         win_gen_lens.append(float(gen_len_mean.item()))
         win_unique_frac.append(float(unique_frac))
@@ -533,7 +522,6 @@ def main() -> None:
                 "kl_std": float(k.std(unbiased=False).item()) if len(win_kls) > 1 else 0.0,
                 "policy_loss_mean": float(sum(win_policy_losses) / len(win_policy_losses)),
                 "total_loss_mean": float(sum(win_total_losses) / len(win_total_losses)),
-                "clip_frac_mean": float(sum(win_clip_fracs) / len(win_clip_fracs)),
                 "adv_mean": float(adv_all.mean().item()),
                 "adv_std": float(adv_all.std(unbiased=False).item()) if adv_all.numel() > 1 else 0.0,
                 "adv_min": float(adv_all.min().item()),
@@ -550,7 +538,6 @@ def main() -> None:
             win_kls.clear()
             win_policy_losses.clear()
             win_total_losses.clear()
-            win_clip_fracs.clear()
             win_adv.clear()
             win_gen_lens.clear()
             win_unique_frac.clear()
