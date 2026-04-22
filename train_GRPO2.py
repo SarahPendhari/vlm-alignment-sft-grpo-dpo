@@ -328,6 +328,19 @@ def main() -> None:
     except Exception:
         pass
 
+    # With gradient checkpointing, ensure checkpointed segments get grad-enabled inputs
+    # (common requirement with PEFT/LoRA to avoid "inputs have requires_grad=False" warnings).
+    try:
+        model.enable_input_require_grads()
+    except Exception:
+        pass
+
+    trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    total = sum(p.numel() for p in model.parameters())
+    print(f"PARAMS trainable/total: {trainable}/{total}")
+    if trainable == 0:
+        raise RuntimeError("No trainable parameters found (all params have requires_grad=False).")
+
     optimizer = torch.optim.AdamW(model.parameters(), lr=cfg.learning_rate)
 
     stream_ds = load_dataset(
