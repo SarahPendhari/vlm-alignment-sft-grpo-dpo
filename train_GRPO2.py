@@ -322,18 +322,8 @@ def main() -> None:
     )
     model = get_peft_model(sft_merged, lora_config)
     model.train()
-    model.config.use_cache = False
-    try:
-        model.gradient_checkpointing_enable()
-    except Exception:
-        pass
-
-    # With gradient checkpointing, ensure checkpointed segments get grad-enabled inputs
-    # (common requirement with PEFT/LoRA to avoid "inputs have requires_grad=False" warnings).
-    try:
-        model.enable_input_require_grads()
-    except Exception:
-        pass
+    # Gradient checkpointing disabled (uses more VRAM, but avoids checkpoint warnings).
+    model.config.use_cache = True
 
     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
     total = sum(p.numel() for p in model.parameters())
