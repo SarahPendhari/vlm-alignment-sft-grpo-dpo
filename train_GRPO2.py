@@ -198,7 +198,7 @@ def load_config() -> Config:
     sft_adapter_dir = Path(
         env_str(
             "SFT_ADAPTER_DIR",
-            str(project_dir / "outputs" / "qwen_sft" / "checkpoint-22188"),
+            str(project_dir / "outputs" / "qwen_sft" ),
         )
     ).resolve()
     grpo_adapter_dir = Path(env_str("GRPO_ADAPTER_DIR", str(project_dir / "outputs" / "qwen_grpo"))).resolve()
@@ -217,7 +217,7 @@ def load_config() -> Config:
         grpo_adapter_dir=grpo_adapter_dir,
         instruction=instruction,
         seed=env_int("SEED", 0),
-        smoke_n=env_int("GRPO_SMOKE_N", 100),
+        smoke_n=env_int("GRPO_SMOKE_N", 15000),
         group_size=env_int("GRPO_GROUP_SIZE", 4),
         max_new_tokens=env_int("GRPO_MAX_NEW_TOKENS", 32),
         temperature=env_float("GRPO_TEMPERATURE", 0.8),
