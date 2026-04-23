@@ -104,8 +104,9 @@ def compute_rewards(raw_generations: List[str], answers: List[str]) -> torch.Ten
 
 def group_advantages(rewards: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
     r_mean = rewards.mean()
-    r_std = rewards.std(unbiased=False)
-    return (rewards - r_mean) / (r_std + eps)
+    # Match TRL's GRPOTrainer: std uses PyTorch default (unbiased=True) and a fixed epsilon.
+    r_std = rewards.std()
+    return (rewards - r_mean) / (r_std + 1e-4)
 
 
 def logprobs_of_generated_tokens(
@@ -134,6 +135,36 @@ def logprobs_of_generated_tokens(
     gen_attn = attention_mask[:, prompt_len:T].to(token_logp.dtype)
     token_logp = token_logp * gen_attn
     return token_logp.sum(dim=-1)  # (B,)
+
+
+def per_token_logprobs_of_generated_tokens(
+    model: Qwen2VLForConditionalGeneration,
+    input_ids: torch.Tensor,
+    attention_mask: torch.Tensor,
+    prompt_len: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Returns per-token log-probabilities for generated tokens.
+
+    Returns:
+      - token_logp: (B, gen_T) log p(x_t) for generated region (masked to 0 where attention=0)
+      - gen_attn:   (B, gen_T) attention mask for generated region (float32/float16 compatible)
+    """
+    out = model(input_ids=input_ids, attention_mask=attention_mask)
+    logits = out.logits  # (B, T, V)
+    _B, T, _V = logits.shape
+    if prompt_len >= T:
+        raise ValueError(f"prompt_len={prompt_len} must be < sequence length T={T}")
+
+    logits_slice = logits[:, prompt_len - 1 : T - 1, :]  # (B, gen_T, V)
+    targets = input_ids[:, prompt_len:T]  # (B, gen_T)
+
+    logp = torch.log_softmax(logits_slice, dim=-1)
+    token_logp = torch.gather(logp, dim=-1, index=targets.unsqueeze(-1)).squeeze(-1)  # (B, gen_T)
+
+    gen_attn = attention_mask[:, prompt_len:T].to(token_logp.dtype)  # (B, gen_T)
+    token_logp = token_logp * gen_attn
+    return token_logp, gen_attn
 
 
 def maybe_remap_lora_safetensors(adapter_dir: Path) -> None:
@@ -262,7 +293,7 @@ def load_config() -> Config:
         instruction=instruction,
         seed=env_int("SEED", 0),
         smoke_n=env_int("GRPO_SMOKE_N", 15000),
-        group_size=env_int("GRPO_GROUP_SIZE", 8),
+        group_size=env_int("GRPO_GROUP_SIZE", 4),
         max_new_tokens=env_int("GRPO_MAX_NEW_TOKENS", 32),
         temperature=env_float("GRPO_TEMPERATURE", 0.8),
         top_p=env_float("GRPO_TOP_P", 0.9),
@@ -427,6 +458,7 @@ def main() -> None:
                 temperature=cfg.temperature,
                 top_p=cfg.top_p,
                 num_return_sequences=cfg.group_size,
+                use_cache=False,
             )
 
         seq_lens = torch.tensor([seq.shape[0] for seq in gen_ids], device=gen_ids.device)
@@ -459,20 +491,33 @@ def main() -> None:
         with torch.no_grad():
             vqa_scores = torch.tensor([vqa_accuracy(g, answers) for g in raw_generations], device=padded.device)
 
-        logp_new = logprobs_of_generated_tokens(model, padded, attn, prompt_len=prompt_len)
+        # Per-token logprobs for stable GRPO + KL (K3 / low-variance estimator).
+        logp_new_tok, gen_attn = per_token_logprobs_of_generated_tokens(model, padded, attn, prompt_len=prompt_len)
 
         with torch.no_grad():
             with model.disable_adapter():
-                logp_ref = logprobs_of_generated_tokens(model, padded, attn, prompt_len=prompt_len)
+                logp_ref_tok, _gen_attn_ref = per_token_logprobs_of_generated_tokens(
+                    model, padded, attn, prompt_len=prompt_len
+                )
 
-        # GRPO (no PPO): policy gradient weighted by group-normalized advantages.
-        policy_loss = -(advantages * logp_new).mean()
+        # Match TRL's GRPOTrainer loss shape:
+        # per_token_loss = -( exp(logp - sg(logp)) * adv  - beta * KL_k3 )
+        # loss = mean_over_batch( mean_over_tokens(per_token_loss, masked) )
+        adv_tok = advantages.to(logp_new_tok.dtype).unsqueeze(1)  # (B, 1)
+        per_token_pg = torch.exp(logp_new_tok - logp_new_tok.detach()) * adv_tok  # (B, gen_T)
 
-        kl = logp_new - logp_ref
-        kl_mean = kl.mean()
-        kl_loss = cfg.beta_kl * kl_mean
+        # KL penalty to reference: K3 (always >= 0), per-token.
+        # delta = log p_ref - log p_new
+        delta = (logp_ref_tok - logp_new_tok)
+        kl_k3 = torch.exp(delta) - delta - 1.0  # (B, gen_T)
 
-        loss = policy_loss + kl_loss
+        per_token_loss = -(per_token_pg - (cfg.beta_kl * kl_k3))  # (B, gen_T)
+        denom_per_seq = gen_attn.sum(dim=1).clamp_min(1.0)  # (B,)
+        loss = ((per_token_loss * gen_attn).sum(dim=1) / denom_per_seq).mean()
+
+        # For logging: match TRL's mean_kl (sequence-mean then batch-mean).
+        kl_mean = ((kl_k3 * gen_attn).sum(dim=1) / denom_per_seq).mean()
+        policy_loss = ((-(per_token_pg) * gen_attn).sum(dim=1) / denom_per_seq).mean()
 
         # --- diagnostics to log ---
         with torch.no_grad():
@@ -480,7 +525,8 @@ def main() -> None:
             gen_len_mean = gen_lens.mean()
             uniq = len(set([s.strip() for s in raw_generations]))
             unique_frac = float(uniq) / float(len(raw_generations))
-            nll_per_tok = (-logp_new / gen_lens).mean()
+            logp_new_sum = logp_new_tok.sum(dim=-1)
+            nll_per_tok = (-logp_new_sum / gen_lens).mean()
 
         (loss / cfg.gradient_accumulation_steps).backward()
 
@@ -500,7 +546,7 @@ def main() -> None:
         win_rewards.append(float(rewards.mean().item()))
         win_kls.append(float(kl_mean.item()))
         win_policy_losses.append(float(policy_loss.item()))
-        win_total_losses.append(float((policy_loss + kl_loss).item()))
+        win_total_losses.append(float(loss.item()))
         win_adv.append(advantages.detach().float().cpu())
         win_gen_lens.append(float(gen_len_mean.item()))
         win_unique_frac.append(float(unique_frac))
