@@ -1,17 +1,11 @@
 """
-Self-contained GRPO training loop script (extracted from GRPO_tests.ipynb).
+Self-contained GRPO training loop script (variant of train_GRPO2.py).
 
-Goal: be able to SSH into a VM and run:
-  python train_GRPO2.py
+Difference vs train_GRPO2.py:
+- The reference policy is the BASE model (no SFT adapter merge).
+- The trainable policy is a fresh LoRA adapter on top of the base model.
 
-It will:
-- load Qwen2-VL base + processor
-- load SFT LoRA adapter and merge it into the base (reference policy)
-- attach a fresh LoRA adapter for GRPO training (trainable policy)
-- run a GRPO/PPO-style loop on streaming VQAv2 (`lmms-lab/VQAv2`, validation split)
-- periodically save checkpoints and append metrics to a TSV file
-
-Configuration is controlled via env vars (see `env_*` functions below).
+Everything else is kept as similar as possible (dataset, generation, reward, KL, logging, checkpoints).
 """
 
 from __future__ import annotations
@@ -34,7 +28,7 @@ from PIL import Image
 from tqdm import tqdm
 from transformers import AutoProcessor, Qwen2VLForConditionalGeneration
 
-from peft import LoraConfig, PeftModel, get_peft_model
+from peft import LoraConfig, get_peft_model
 
 from src.metrics import extract_answer, vqa_accuracy
 
@@ -109,34 +103,6 @@ def group_advantages(rewards: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
     return (rewards - r_mean) / (r_std + 1e-4)
 
 
-def logprobs_of_generated_tokens(
-    model: Qwen2VLForConditionalGeneration,
-    input_ids: torch.Tensor,
-    attention_mask: torch.Tensor,
-    prompt_len: int,
-) -> torch.Tensor:
-    """
-    Returns sum log-prob of generated tokens for each sequence.
-    `input_ids` include prompt+generated.
-    We score next-token logits and sum log p(x_t) over generated region.
-    """
-    out = model(input_ids=input_ids, attention_mask=attention_mask)
-    logits = out.logits  # (B, T, V)
-    B, T, _V = logits.shape
-    if prompt_len >= T:
-        raise ValueError(f"prompt_len={prompt_len} must be < sequence length T={T}")
-
-    logits_slice = logits[:, prompt_len - 1 : T - 1, :]  # (B, gen_T, V)
-    targets = input_ids[:, prompt_len:T]  # (B, gen_T)
-
-    logp = torch.log_softmax(logits_slice, dim=-1)
-    token_logp = torch.gather(logp, dim=-1, index=targets.unsqueeze(-1)).squeeze(-1)  # (B, gen_T)
-
-    gen_attn = attention_mask[:, prompt_len:T].to(token_logp.dtype)
-    token_logp = token_logp * gen_attn
-    return token_logp.sum(dim=-1)  # (B,)
-
-
 def per_token_logprobs_of_generated_tokens(
     model: Qwen2VLForConditionalGeneration,
     input_ids: torch.Tensor,
@@ -167,32 +133,11 @@ def per_token_logprobs_of_generated_tokens(
     return token_logp, gen_attn
 
 
-def maybe_remap_lora_safetensors(adapter_dir: Path) -> None:
-    """
-    Notebook had a one-off remap where checkpoint contained `adapter_model2.safetensors`
-    with keys like `...language_model.layers...`, while PEFT expects `adapter_model.safetensors`
-    with `...layers...`.
-
-    If adapter_model.safetensors is missing but adapter_model2.safetensors exists, remap+write.
-    """
-    dst = adapter_dir / "adapter_model.safetensors"
-    src = adapter_dir / "adapter_model2.safetensors"
-    if dst.exists() or not src.exists():
-        return
-
-    from safetensors.torch import load_file, save_file
-
-    sd = load_file(str(src))
-    remapped = {k.replace(".language_model.layers.", ".layers."): v for k, v in sd.items()}
-    save_file(remapped, str(dst))
-
-
 @dataclass(frozen=True)
 class Config:
     project_dir: Path
     model_name: str
     cache_dir: str
-    sft_adapter_dir: Path
     grpo_adapter_dir: Path
     instruction: Optional[str]
     seed: int
@@ -226,7 +171,6 @@ def write_run_config(cfg: Config) -> None:
         "project_dir": str(cfg.project_dir),
         "model_name": cfg.model_name,
         "cache_dir": cfg.cache_dir,
-        "sft_adapter_dir": str(cfg.sft_adapter_dir),
         "grpo_adapter_dir": str(cfg.grpo_adapter_dir),
         "instruction": cfg.instruction,
         "seed": cfg.seed,
@@ -245,6 +189,7 @@ def write_run_config(cfg: Config) -> None:
         "out_dir": str(cfg.out_dir),
         "log_path": str(cfg.log_path),
         "created_at": datetime.now().isoformat(timespec="seconds"),
+        "reference_policy": "base_model",
     }
     path = cfg.out_dir / "run_config.json"
     with open(path, "w") as f:
@@ -258,16 +203,9 @@ def load_config() -> Config:
     model_name = env_str("MODEL_NAME", "Qwen/Qwen2-VL-2B-Instruct")
     cache_dir = env_str("HF_HOME", str(project_dir / "cache"))
 
-    # Adapters
-    sft_adapter_dir = Path(
-        env_str(
-            "SFT_ADAPTER_DIR",
-            str(project_dir / "outputs" / "qwen_sft" ),
-        )
-    ).resolve()
     grpo_adapter_dir = Path(env_str("GRPO_ADAPTER_DIR", str(project_dir / "outputs" / "qwen_grpo"))).resolve()
 
-    instruction_raw = os.environ.get("INSTRUCTION", "ONE WORD WITHOUT BALISE, NO <answer> OR <thinking> ")
+    instruction_raw = os.environ.get("INSTRUCTION", "ANSWER IN ONE SINGLE WORD")
     instruction = instruction_raw.strip() if isinstance(instruction_raw, str) and instruction_raw.strip() else None
 
     # Output dir: if user doesn't specify, make it unique per run to avoid overwriting.
@@ -288,19 +226,18 @@ def load_config() -> Config:
         project_dir=project_dir,
         model_name=model_name,
         cache_dir=cache_dir,
-        sft_adapter_dir=sft_adapter_dir,
         grpo_adapter_dir=grpo_adapter_dir,
         instruction=instruction,
         seed=env_int("SEED", 0),
         smoke_n=env_int("GRPO_SMOKE_N", 15000),
         group_size=env_int("GRPO_GROUP_SIZE", 4),
-        max_new_tokens=env_int("GRPO_MAX_NEW_TOKENS", 16),
-        temperature=env_float("GRPO_TEMPERATURE", 0.7),
-        top_p=env_float("GRPO_TOP_P", 0.9),
-        learning_rate=env_float("GRPO_LR", 5e-5),
+        max_new_tokens=env_int("GRPO_MAX_NEW_TOKENS", 8),
+        temperature=env_float("GRPO_TEMPERATURE", 0.1),
+        top_p=env_float("GRPO_TOP_P", 0.95),
+        learning_rate=env_float("GRPO_LR", 1e-4),
         gradient_accumulation_steps=env_int("GRPO_GRAD_ACCUM", 8),
         max_grad_norm=env_float("GRPO_MAX_GRAD_NORM", 1.0),
-        beta_kl=env_float("GRPO_BETA_KL", 0.1),
+        beta_kl=env_float("GRPO_BETA_KL", 0.05),
         log_every=env_int("GRPO_LOG_EVERY", 2),
         save_every=env_int("GRPO_SAVE_EVERY", 500),
         log_table_every=env_int("GRPO_LOG_TABLE_EVERY", 100),
@@ -356,16 +293,12 @@ def main() -> None:
     print("PROJECT_DIR:", str(cfg.project_dir))
     print("MODEL_NAME:", cfg.model_name)
     print("CACHE_DIR:", cfg.cache_dir)
-    print("SFT_ADAPTER_DIR:", str(cfg.sft_adapter_dir), "exists=", cfg.sft_adapter_dir.exists())
     print("GRPO_ADAPTER_DIR:", str(cfg.grpo_adapter_dir), "exists=", cfg.grpo_adapter_dir.exists())
     print("OUT:", str(cfg.out_dir))
     print("LOG:", str(cfg.log_path))
+    print("REFERENCE_POLICY: base_model")
 
     processor = AutoProcessor.from_pretrained(cfg.model_name, cache_dir=cfg.cache_dir)
-
-    # Some checkpoints in this project used adapter_model2.safetensors + key remap.
-    if cfg.sft_adapter_dir.exists():
-        maybe_remap_lora_safetensors(cfg.sft_adapter_dir)
 
     base_model = Qwen2VLForConditionalGeneration.from_pretrained(
         cfg.model_name,
@@ -374,17 +307,7 @@ def main() -> None:
         cache_dir=cfg.cache_dir,
     )
 
-    print("Loading SFT adapter and merging into base (reference policy)...")
-    sft_merged = PeftModel.from_pretrained(base_model, str(cfg.sft_adapter_dir))
-    sft_merged = sft_merged.merge_and_unload()
-
-    try:
-        processor_sft = AutoProcessor.from_pretrained(str(cfg.sft_adapter_dir))
-        print("Loaded processor from SFT adapter dir.")
-    except Exception as e:
-        processor_sft = processor
-        print("Falling back to base processor (could not load from SFT dir):", repr(e))
-
+    # Trainable policy: fresh LoRA on top of base model (reference is base via disable_adapter()).
     lora_config = LoraConfig(
         r=16,
         lora_alpha=32,
@@ -393,7 +316,7 @@ def main() -> None:
         bias="none",
         task_type="CAUSAL_LM",
     )
-    model = get_peft_model(sft_merged, lora_config)
+    model = get_peft_model(base_model, lora_config)
     model.train()
     # Gradient checkpointing disabled (uses more VRAM, but avoids checkpoint warnings).
     model.config.use_cache = True
@@ -406,6 +329,9 @@ def main() -> None:
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=cfg.learning_rate)
 
+    # Load from the local HF cache (no streaming). With HF_HOME/HF_DATASETS_CACHE
+    # pointing to the attached volume, this should hit disk cache and avoid network
+    # reads once cached.
     stream_ds = load_dataset(
         "lmms-lab/VQAv2",
         split="validation",
@@ -432,7 +358,7 @@ def main() -> None:
     running_loss = 0.0
     running_vqa = 0.0
 
-    pbar = tqdm(total=cfg.smoke_n, desc="GRPO train (script)")
+    pbar = tqdm(total=cfg.smoke_n, desc="GRPO train (base ref)")
 
     for ex in islice(stream_ds, cfg.smoke_n):
         question = ex["question"]
@@ -440,8 +366,8 @@ def main() -> None:
         image = _to_pil(ex["image"])
 
         messages = build_prompt_messages(question, cfg.instruction)
-        text_prompt = make_text_prompt(processor_sft, messages)
-        inputs = processor_sft(
+        text_prompt = make_text_prompt(processor, messages)
+        inputs = processor(
             text=[text_prompt],
             images=[image],
             padding=True,
@@ -466,9 +392,9 @@ def main() -> None:
         seq_lens = torch.tensor([seq.shape[0] for seq in gen_ids], device=gen_ids.device)
         max_len = int(seq_lens.max().item())
 
-        pad_id = processor_sft.tokenizer.pad_token_id
+        pad_id = processor.tokenizer.pad_token_id
         if pad_id is None:
-            pad_id = processor_sft.tokenizer.eos_token_id
+            pad_id = processor.tokenizer.eos_token_id
 
         padded = torch.full((cfg.group_size, max_len), pad_id, dtype=gen_ids.dtype, device=gen_ids.device)
         attn = torch.zeros((cfg.group_size, max_len), dtype=torch.long, device=gen_ids.device)
@@ -485,7 +411,7 @@ def main() -> None:
             gen_part = out_ids[prompt_len:]
             trimmed.append(gen_part)
 
-        raw_generations = processor_sft.batch_decode(trimmed, skip_special_tokens=True)
+        raw_generations = processor.batch_decode(trimmed, skip_special_tokens=True)
 
         rewards = compute_rewards(raw_generations=raw_generations, answers=answers).to(padded.device)
         advantages = group_advantages(rewards)
@@ -621,7 +547,7 @@ def main() -> None:
             ck = cfg.out_dir / f"checkpoint-{global_step}"
             ck.mkdir(parents=True, exist_ok=True)
             model.save_pretrained(ck)
-            processor_sft.save_pretrained(ck)
+            processor.save_pretrained(ck)
             print(f"Checkpoint: {ck}")
 
     pbar.close()
@@ -629,7 +555,7 @@ def main() -> None:
     print("Metrics TSV:", str(cfg.log_path))
 
     model.save_pretrained(cfg.out_dir)
-    processor_sft.save_pretrained(cfg.out_dir)
+    processor.save_pretrained(cfg.out_dir)
     print("Final adapter saved under:", str(cfg.out_dir))
 
 

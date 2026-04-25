@@ -1,17 +1,9 @@
 """
-Self-contained GRPO training loop script (extracted from GRPO_tests.ipynb).
+Self-contained GRPO training loop script (derived from train_GRPO2.py).
 
-Goal: be able to SSH into a VM and run:
-  python train_GRPO2.py
-
-It will:
-- load Qwen2-VL base + processor
-- load SFT LoRA adapter and merge it into the base (reference policy)
-- attach a fresh LoRA adapter for GRPO training (trainable policy)
-- run a GRPO/PPO-style loop on streaming VQAv2 (`lmms-lab/VQAv2`, validation split)
-- periodically save checkpoints and append metrics to a TSV file
-
-Configuration is controlled via env vars (see `env_*` functions below).
+Difference vs train_GRPO2.py:
+- Uses a LOCAL VQAv2 subset created by make_vqav2_local_subset.py (dataset.jsonl + images/).
+- Everything else is kept the same: model/ref setup, rewards, logging, checkpoints, env vars.
 """
 
 from __future__ import annotations
@@ -109,34 +101,6 @@ def group_advantages(rewards: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
     return (rewards - r_mean) / (r_std + 1e-4)
 
 
-def logprobs_of_generated_tokens(
-    model: Qwen2VLForConditionalGeneration,
-    input_ids: torch.Tensor,
-    attention_mask: torch.Tensor,
-    prompt_len: int,
-) -> torch.Tensor:
-    """
-    Returns sum log-prob of generated tokens for each sequence.
-    `input_ids` include prompt+generated.
-    We score next-token logits and sum log p(x_t) over generated region.
-    """
-    out = model(input_ids=input_ids, attention_mask=attention_mask)
-    logits = out.logits  # (B, T, V)
-    B, T, _V = logits.shape
-    if prompt_len >= T:
-        raise ValueError(f"prompt_len={prompt_len} must be < sequence length T={T}")
-
-    logits_slice = logits[:, prompt_len - 1 : T - 1, :]  # (B, gen_T, V)
-    targets = input_ids[:, prompt_len:T]  # (B, gen_T)
-
-    logp = torch.log_softmax(logits_slice, dim=-1)
-    token_logp = torch.gather(logp, dim=-1, index=targets.unsqueeze(-1)).squeeze(-1)  # (B, gen_T)
-
-    gen_attn = attention_mask[:, prompt_len:T].to(token_logp.dtype)
-    token_logp = token_logp * gen_attn
-    return token_logp.sum(dim=-1)  # (B,)
-
-
 def per_token_logprobs_of_generated_tokens(
     model: Qwen2VLForConditionalGeneration,
     input_ids: torch.Tensor,
@@ -197,6 +161,9 @@ class Config:
     instruction: Optional[str]
     seed: int
 
+    # local dataset
+    local_data_dir: Path
+
     # rollout/gen
     group_size: int
     max_new_tokens: int
@@ -230,6 +197,7 @@ def write_run_config(cfg: Config) -> None:
         "grpo_adapter_dir": str(cfg.grpo_adapter_dir),
         "instruction": cfg.instruction,
         "seed": cfg.seed,
+        "local_data_dir": str(cfg.local_data_dir),
         "group_size": cfg.group_size,
         "max_new_tokens": cfg.max_new_tokens,
         "temperature": cfg.temperature,
@@ -245,6 +213,7 @@ def write_run_config(cfg: Config) -> None:
         "out_dir": str(cfg.out_dir),
         "log_path": str(cfg.log_path),
         "created_at": datetime.now().isoformat(timespec="seconds"),
+        "dataset": "local_subset_jsonl",
     }
     path = cfg.out_dir / "run_config.json"
     with open(path, "w") as f:
@@ -262,10 +231,12 @@ def load_config() -> Config:
     sft_adapter_dir = Path(
         env_str(
             "SFT_ADAPTER_DIR",
-            str(project_dir / "outputs" / "qwen_sft" ),
+            str(project_dir / "outputs" / "qwen_sft"),
         )
     ).resolve()
     grpo_adapter_dir = Path(env_str("GRPO_ADAPTER_DIR", str(project_dir / "outputs" / "qwen_grpo"))).resolve()
+
+    local_data_dir = Path(env_str("LOCAL_VQAV2_DIR", "/mnt/data/vqav2_15k")).expanduser().resolve()
 
     instruction_raw = os.environ.get("INSTRUCTION", "ONE WORD WITHOUT BALISE, NO <answer> OR <thinking> ")
     instruction = instruction_raw.strip() if isinstance(instruction_raw, str) and instruction_raw.strip() else None
@@ -292,15 +263,16 @@ def load_config() -> Config:
         grpo_adapter_dir=grpo_adapter_dir,
         instruction=instruction,
         seed=env_int("SEED", 0),
+        local_data_dir=local_data_dir,
         smoke_n=env_int("GRPO_SMOKE_N", 15000),
         group_size=env_int("GRPO_GROUP_SIZE", 4),
         max_new_tokens=env_int("GRPO_MAX_NEW_TOKENS", 16),
-        temperature=env_float("GRPO_TEMPERATURE", 0.7),
+        temperature=env_float("GRPO_TEMPERATURE", 0.8),
         top_p=env_float("GRPO_TOP_P", 0.9),
-        learning_rate=env_float("GRPO_LR", 5e-5),
+        learning_rate=env_float("GRPO_LR", 1e-4),
         gradient_accumulation_steps=env_int("GRPO_GRAD_ACCUM", 8),
         max_grad_norm=env_float("GRPO_MAX_GRAD_NORM", 1.0),
-        beta_kl=env_float("GRPO_BETA_KL", 0.1),
+        beta_kl=env_float("GRPO_BETA_KL", 0.08),
         log_every=env_int("GRPO_LOG_EVERY", 2),
         save_every=env_int("GRPO_SAVE_EVERY", 500),
         log_table_every=env_int("GRPO_LOG_TABLE_EVERY", 100),
@@ -358,6 +330,7 @@ def main() -> None:
     print("CACHE_DIR:", cfg.cache_dir)
     print("SFT_ADAPTER_DIR:", str(cfg.sft_adapter_dir), "exists=", cfg.sft_adapter_dir.exists())
     print("GRPO_ADAPTER_DIR:", str(cfg.grpo_adapter_dir), "exists=", cfg.grpo_adapter_dir.exists())
+    print("LOCAL_VQAV2_DIR:", str(cfg.local_data_dir), "exists=", cfg.local_data_dir.exists())
     print("OUT:", str(cfg.out_dir))
     print("LOG:", str(cfg.log_path))
 
@@ -406,11 +379,10 @@ def main() -> None:
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=cfg.learning_rate)
 
-    stream_ds = load_dataset(
-        "lmms-lab/VQAv2",
-        split="validation",
-        streaming=True,
-    )
+    # Local subset created by make_vqav2_local_subset.py
+    manifest_path = cfg.local_data_dir / "dataset.jsonl"
+    images_dir = cfg.local_data_dir  # image_path is stored relative to local_data_dir
+    local_ds = load_dataset("json", data_files=str(manifest_path), split="train", streaming=True)
 
     global_step = 0
     opt_step = 0
@@ -432,12 +404,13 @@ def main() -> None:
     running_loss = 0.0
     running_vqa = 0.0
 
-    pbar = tqdm(total=cfg.smoke_n, desc="GRPO train (script)")
+    pbar = tqdm(total=cfg.smoke_n, desc="GRPO train (local subset)")
 
-    for ex in islice(stream_ds, cfg.smoke_n):
+    for ex in islice(local_ds, cfg.smoke_n):
         question = ex["question"]
-        answers = [a["answer"] for a in ex["answers"]]
-        image = _to_pil(ex["image"])
+        answers = list(ex.get("answers", []))
+        img_rel = ex["image_path"]
+        image = Image.open(images_dir / img_rel).convert("RGB")
 
         messages = build_prompt_messages(question, cfg.instruction)
         text_prompt = make_text_prompt(processor_sft, messages)
